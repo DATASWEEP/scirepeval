@@ -203,7 +203,13 @@ if __name__ == "__main__":
             if not args.prompt_file or not os.path.exists(args.prompt_file):
                 raise ValueError("Instructor model requires JSON file with prompts to use.")
             task_prompts = load_prompts_from_file(args.prompt_file, args.prompt_name)
-            model = model_class_map[args.model_type](args.model, task_prompts)
+            model_cls = model_class_map.get(args.model_type)
+            if model_cls is None:
+                available = [k for k, v in model_class_map.items() if v is not None]
+                raise ValueError(
+                    f"Unsupported --model-type '{args.model_type}'. Available types: {available}"
+                )
+            model = model_cls(args.model, task_prompts, use_fp16=args.fp16)
     else:
         model = Model(
             variant=args.mtype,
