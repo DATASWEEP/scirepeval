@@ -191,8 +191,20 @@ if __name__ == "__main__":
     parser.add_argument('--prompt-name', type=str, help='Name of prompt within prompt file to use.', default="blank")
     parser.add_argument('--embeddings-save-path', type=str, default=None, help='Path to parent directory where embeddings will be saved. If specified, config paths are treated as relative to this path.')
     parser.add_argument('--task-specific-prompts', action='store_true')
+    parser.add_argument(
+        '--hf-token',
+        type=str,
+        default=None,
+        help='Hugging Face token for gated models. If omitted, uses HF_TOKEN or HUGGINGFACE_HUB_TOKEN env var.'
+    )
 
     args = parser.parse_args()
+    hf_token = args.hf_token
+    if hf_token:
+        # Make token available to huggingface_hub/transformers/sentence-transformers loaders.
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+
     adapters_load_from = args.adapters_dir if args.adapters_dir else args.adapters_chkpt
     if args.gpt3_model:
         model = GPT3Model(embed_model=args.gpt3_model)
