@@ -32,7 +32,6 @@ class EmbeddingsGenerator:
                             results[paper_id] += embedding.detach().cpu().numpy()
                     del batch
                     del emb
-                    torch.cuda.empty_cache()
             results = {k: v/len(self.models) for k, v in results.items()}
         except Exception as e:
             logger.error("Exception in generating embeddings", exc_info=e)

@@ -7,6 +7,9 @@ import warnings
 from string import Formatter
 import json
 from copy import deepcopy
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Lazy import for optional dependencies
 try:
@@ -239,7 +242,8 @@ class PromptFormatter:
 
 class InstructorEmbeddingModel(ABC):
 
-    def __init__(self, embed_model: str, model_type: str, task_prompts: Dict[str, str], eos_token: str = None):
+    def __init__(self, embed_model: str, model_type: str, task_prompts: Dict[str, str], eos_token: str = None,
+                 use_fp16: bool = False):
         is_compatible, error_msg = _check_version_compatibility(model_type)
         if not is_compatible:
             raise ValueError(error_msg)
@@ -249,6 +253,8 @@ class InstructorEmbeddingModel(ABC):
         self.task_id = None
         self.task_name = None
         self.formatter = None
+        self.use_fp16 = use_fp16
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     def _setup_tokenizer_sep_token(self, tokenizer):
         if hasattr(tokenizer, 'eos_token'):
@@ -278,8 +284,8 @@ class InstructorEmbeddingModel(ABC):
 
 class GemmaModel(InstructorEmbeddingModel):
 
-    def __init__(self, embed_model: str, task_prompts: Dict[str, str]):
-        super().__init__(embed_model, "gemma", task_prompts)
+    def __init__(self, embed_model: str, task_prompts: Dict[str, str], use_fp16: bool = False):
+        super().__init__(embed_model, "gemma", task_prompts, use_fp16=use_fp16)
 
         self.encoder = SentenceTransformer(self.embed_model)
         self.tokenizer = self.encoder.tokenizer
@@ -287,7 +293,12 @@ class GemmaModel(InstructorEmbeddingModel):
         self.formatter = PromptFormatter(task_prompts)
 
     def _encode_batch(self, formatted_batch: List[str]) -> torch.Tensor:
-        return self.encoder.encode(formatted_batch, convert_to_tensor=True,device="cuda")
+        return self.encoder.encode(
+            formatted_batch,
+            convert_to_tensor=True,
+            device=self.device,
+            show_progress_bar=False
+        )
 
     def __call__(self, batch: List[str], batch_ids: Optional[List] = None):
         formatted_batch = self.formatter.format_batch(
@@ -303,16 +314,57 @@ class GemmaModel(InstructorEmbeddingModel):
 
 class Qwen3Model(InstructorEmbeddingModel):
 
-    def __init__(self, embed_model: str, task_prompts: Dict[str, str]):
-        super().__init__(embed_model, "qwen3", task_prompts)
+    def __init__(self, embed_model: str, task_prompts: Dict[str, str], use_fp16: bool = False):
+        super().__init__(embed_model, "qwen3", task_prompts, use_fp16=use_fp16)
 
-        self.encoder = SentenceTransformer(embed_model)
-        self.tokenizer = AutoTokenizer.from_pretrained(self.embed_model)
+        model_kwargs = {}
+        if self.use_fp16:
+            model_kwargs["dtype"] = torch.float16
+        if torch.cuda.is_available():
+            # Prefer FlashAttention2 on CUDA for Qwen3 throughput/memory efficiency.
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        st_kwargs = {
+            "tokenizer_kwargs": {"padding_side": "left"}
+        }
+        if model_kwargs:
+            st_kwargs["model_kwargs"] = model_kwargs
+
+        try:
+            self.encoder = SentenceTransformer(embed_model, **st_kwargs)
+        except Exception as e:
+            if model_kwargs.get("attn_implementation") == "flash_attention_2":
+                logger.warning(
+                    "FlashAttention2 unavailable for %s. Falling back to default attention. Error: %s",
+                    embed_model,
+                    str(e),
+                )
+                model_kwargs.pop("attn_implementation", None)
+                if model_kwargs:
+                    self.encoder = SentenceTransformer(
+                        embed_model,
+                        model_kwargs=model_kwargs,
+                        tokenizer_kwargs={"padding_side": "left"}
+                    )
+                else:
+                    self.encoder = SentenceTransformer(
+                        embed_model,
+                        tokenizer_kwargs={"padding_side": "left"}
+                    )
+            else:
+                raise
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.embed_model, padding_side="left")
         self._setup_tokenizer_sep_token(self.tokenizer)
         self.formatter = PromptFormatter(task_prompts)
 
     def _encode_batch(self, formatted_batch: List[str]) -> torch.Tensor:
-        return self.encoder.encode(sentences=formatted_batch, convert_to_tensor=True, device="cuda")
+        return self.encoder.encode(
+            sentences=formatted_batch,
+            convert_to_tensor=True,
+            device=self.device,
+            show_progress_bar=False
+        )
 
     def __call__(self, batch: List[str], batch_ids: Optional[List] = None):
         batch = self._replace_sep_placeholder(batch)
@@ -330,11 +382,15 @@ class Qwen3Model(InstructorEmbeddingModel):
 
 class F2LLMModel(InstructorEmbeddingModel):
 
-    def __init__(self, embed_model: str, task_prompts: Dict[str, str]):
-        super().__init__(embed_model, "f2llm", task_prompts)
+    def __init__(self, embed_model: str, task_prompts: Dict[str, str], use_fp16: bool = False):
+        super().__init__(embed_model, "f2llm", task_prompts, use_fp16=use_fp16)
 
         # Load model and tokenizer using transformers
-        self.model = AutoModel.from_pretrained(embed_model).cuda()
+        model_dtype = torch.float16 if self.use_fp16 and torch.cuda.is_available() else None
+        if model_dtype is not None:
+            self.model = AutoModel.from_pretrained(embed_model, torch_dtype=model_dtype).to(self.device)
+        else:
+            self.model = AutoModel.from_pretrained(embed_model).to(self.device)
         self.tokenizer = AutoTokenizer.from_pretrained(embed_model)
         self._setup_tokenizer_sep_token(self.tokenizer)
         self.formatter = PromptFormatter(task_prompts)
@@ -352,7 +408,7 @@ class F2LLMModel(InstructorEmbeddingModel):
             padding=True,
             return_tensors='pt',
             add_special_tokens=False
-        ).to("cuda")
+        ).to(self.device)
 
         # Get last hidden state
         with torch.no_grad():
@@ -361,7 +417,7 @@ class F2LLMModel(InstructorEmbeddingModel):
         # Extract embeddings from the final token position (EOS position)
         eos_positions = tokenized_inputs.attention_mask.sum(dim=1) - 1
         embeddings = last_hidden_state[
-            torch.arange(len(sentences_with_eos), device="cuda"),
+            torch.arange(len(sentences_with_eos), device=self.device),
             eos_positions
         ]
 
@@ -386,8 +442,8 @@ class F2LLMModel(InstructorEmbeddingModel):
 
 class GritLMModel(InstructorEmbeddingModel):
 
-    def __init__(self, embed_model: str, task_prompts: Dict[str, str]):
-        super().__init__(embed_model, "gritlm", task_prompts)
+    def __init__(self, embed_model: str, task_prompts: Dict[str, str], use_fp16: bool = False):
+        super().__init__(embed_model, "gritlm", task_prompts, use_fp16=use_fp16)
 
         if not GRITLM_AVAILABLE:
             raise ImportError(
@@ -395,7 +451,8 @@ class GritLMModel(InstructorEmbeddingModel):
                 "Please install: pip install gritlm"
             )
 
-        self.encoder = GritLM(self.embed_model, torch_dtype="auto", mode="embedding")
+        grit_dtype = torch.float16 if self.use_fp16 else "auto"
+        self.encoder = GritLM(self.embed_model, torch_dtype=grit_dtype, mode="embedding")
         self.tokenizer = self.encoder.tokenizer
         self._setup_tokenizer_sep_token(self.tokenizer)
 
